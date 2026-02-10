@@ -1,74 +1,86 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from schemas.vulnerability import ClusteringResponse, ClusterSummary
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
+from schemas.vulnerability import ClusteringResponse
 from services.clustering_service import ClusteringService
-from typing import List
 import json
-import os
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import asyncio
 
-app = FastAPI(title="Semgrep Rule Gen Backend")
+# ---------------- APP & SERVICE ----------------
+
+# Initialize the service (this will trigger the S-BERT model download/load)
 cluster_service = ClusteringService()
+observer: Observer | None = None
 
-# 1. Use Absolute Paths for Reliability
-BASE_DIR = Path(__file__).resolve().parent
-JSON_FILE_PATH = BASE_DIR / "data" / "patch_analysis.json"
+# ---------------- PATH CONFIG ----------------
 
-# --- AUTOMATED FILE WATCHER LOGIC ---
+# Resolves to the directory containing main.py (Crucial for Docker)
+JSON_FILE = Path("gemini_vulnerability_signatures_2022.json")
+
+
+# ---------------- FILE WATCHER ----------------
+
 class PatchFileHandler(FileSystemEventHandler):
+    """
+    Monitors the 'data' directory for changes to patch_analysis.json.
+    """
+
     def on_modified(self, event):
-        if event.src_path == str(JSON_FILE_PATH):
-            print(f"Detected change in {JSON_FILE_PATH}. Re-clustering...")
-            self.trigger_recluster()
+        if event.src_path.endswith("gemini_vulnerability_signatures_2022.json"):
+            print(f"Change detected in {JSON_FILE}. Re-clustering...")
+            asyncio.create_task(trigger_recluster())
 
-    def trigger_recluster(self):
-        with open(JSON_FILE_PATH, 'r') as f:
-            data = json.load(f)
-        # We use a thread-safe way to run the async pipeline
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(cluster_service.run_clustering_pipeline(data))
-        print("Auto-update complete.")
+async def trigger_recluster():
+    if JSON_FILE.exists():
+        with open(JSON_FILE, "r") as f:
+            await cluster_service.run_clustering_pipeline(json.load(f))
+        print("Clusters updated from local JSON.")
 
-def start_file_watcher():
+async def lifespan(app: FastAPI):
+    global observer
+    await trigger_recluster()
     observer = Observer()
-    handler = PatchFileHandler()
-    # Watch the directory containing the file
-    observer.schedule(handler, path=str(JSON_FILE_PATH.parent), recursive=False)
+    observer.schedule(PatchFileHandler(), path=".", recursive=False)
     observer.start()
+    yield
+    observer.stop()
 
-@app.on_event("startup")
-async def startup_event():
-    # Start the watcher when the API starts
-    if JSON_FILE_PATH.exists():
-        print("Starting file watcher...")
-        start_file_watcher()
-        # Run initial clustering on startup
-        with open(JSON_FILE_PATH, 'r') as f:
-            data = json.load(f)
-        await cluster_service.run_clustering_pipeline(data)
-    else:
-        print(f"WARNING: Initial file not found at {JSON_FILE_PATH}")
+# ---------------- FASTAPI APP ----------------
 
-# --- ENDPOINTS ---
+app = FastAPI(
+    title="Semgrep Rule Gen Backend",
+    description="Clusters vulnerability descriptions using semantic embeddings and dynamic Agglomerative Clustering.",
+    lifespan=lifespan
+)
+print("🔥 LOADED NEW MAIN.PY 🔥")
 
-@app.post("/trigger-update", status_code=202)
-async def update_clusters(background_tasks: BackgroundTasks):
-    if not JSON_FILE_PATH.exists():
-        raise HTTPException(status_code=404, detail=f"File not found at {JSON_FILE_PATH}")
 
-    async def run_pipeline():
-        with open(JSON_FILE_PATH, 'r') as f:
-            data = json.load(f)
-        await cluster_service.run_clustering_pipeline(data)
+# ---------------- ENDPOINTS ----------------
 
-    background_tasks.add_task(run_pipeline)
-    return {"message": "Clustering update initiated manually."}
+@app.post("/cluster")
+async def cluster_file(file: UploadFile = File(...)):
+    if not file.filename.endswith(".json"):
+        raise HTTPException(400, "Only JSON files allowed")
+
+    data = json.load(file.file)
+    await cluster_service.run_clustering_pipeline(data)
+
+    return {
+        "status": "clustering completed",
+        "records": len(data)
+    }
 
 @app.get("/results", response_model=ClusteringResponse)
-async def get_full_results():
+async def get_results():
     if not cluster_service.latest_results:
-        raise HTTPException(status_code=400, detail="No clustering results available.")
+        raise HTTPException(400, "Run clustering first")
     return cluster_service.latest_results
+
+@app.get("/visualization")
+async def get_visualization():
+    plot = Path("cluster_plot.png")
+    if not plot.exists():
+        raise HTTPException(400, "Visualization not generated yet")
+    return FileResponse(plot)
