@@ -1,12 +1,9 @@
-from pathlib import Path
 import pandas as pd
 import numpy as np
 import re
 import nltk
 from nltk.corpus import stopwords
 from collections import Counter
-import matplotlib
-matplotlib.use('Agg') # Required for non-interactive backend (Docker/Servers)
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.cluster import AgglomerativeClustering
@@ -17,10 +14,12 @@ from schemas.vulnerability import ClusteredVulnerability, ClusterSummary
 
 
 class ClusteringService:
-    def __init__(self):       # Using the higher-accuracy 12-layer model from the notebook
+    def __init__(self):
+        # Using the L12 model as per notebook requirements
         self.model = SentenceTransformer('all-MiniLM-L12-v2')
-        self.pca = PCA(n_components=30, random_state=42)
-        self.latest_results = None
+        self.pca_components = 25  # Updated from notebook best params
+        self.dist_threshold = 0.65  # Updated from notebook best params
+
         try:
             nltk.data.find('corpora/stopwords')
         except LookupError:
@@ -38,8 +37,7 @@ class ClusteringService:
     def clean_label(self, label: str) -> str:
         if not isinstance(label, str): return "other"
         label = label.lower().replace('_', '-').strip()
-        if label == 'cross-site-request-forgery-xss':
-            label = 'cross-site-scripting-xss'
+        if 'xss' in label: return 'cross-site-scripting-xss'
         return label
 
     def preprocess_text(self, text: str) -> str:
@@ -47,72 +45,56 @@ class ClusteringService:
         text = text.lower()
         text = re.sub(r'[^a-z\s]', '', text)
         words = text.split()
-        # Filter stopwords, security noise, and short tokens (> 2 chars)
+        # Filter noise and short tokens (> 2 chars) matching notebook logic
         filtered = [w for w in words if w not in self.stop_words and len(w) > 2]
         return " ".join(filtered)
 
-    def generate_visualization(self, df: pd.DataFrame, reduced_embeddings: np.ndarray):
-        """Generates t-SNE plot and saves it to the static directory."""
-        plt.figure(figsize=(12, 8))
-
-        # t-SNE for 2D visualization
-        tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+    def generate_visualization(self, reduced_embeddings: np.ndarray, labels: np.ndarray):
+        """Generates a t-SNE plot for the clusters."""
+        plt.figure(figsize=(10, 7))
+        # Use t-SNE to project the 25 PCA components down to 2D for plotting
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(reduced_embeddings) - 1))
         vis_dims = tsne.fit_transform(reduced_embeddings)
 
-        scatter = plt.scatter(
-            vis_dims[:, 0],
-            vis_dims[:, 1],
-            c=df['cluster'],
-            cmap='tab20',
-            s=50,
-            alpha=0.6
-        )
-
-        plt.title('Vulnerability Semantic Clusters', fontsize=15)
+        scatter = plt.scatter(vis_dims[:, 0], vis_dims[:, 1], c=labels, cmap='tab20', s=50, alpha=0.7)
         plt.colorbar(scatter, label='Cluster ID')
-        plt.grid(True, linestyle='--', alpha=0.5)
-
-        # Save to static folder
+        plt.title(f'Cluster Visualization (Threshold: 0.65, PCA: 25)')
         plt.savefig("cluster_plot.png")
         plt.close()
-        return "/static/cluster_plot.png"
+        return "/visualization"
 
     async def run_clustering_pipeline(self, json_data: list):
         df = pd.DataFrame(json_data)
-        if len(df) <= 1: return None
+        if len(df) < 2: return None
 
-        # 1. Preprocessing & Label Cleaning
+        # 1. Preprocessing
         df['clean_label'] = df['vulnerability_type'].apply(self.clean_label)
         df['processed_desc'] = df['description'].apply(self.preprocess_text)
 
-        # 2. Vectorization & Dynamic PCA
+        # 2. Vectorization & PCA (Fixed 25 components)
         embeddings = self.model.encode(df['processed_desc'].tolist(), show_progress_bar=False)
-        pca = PCA(n_components=min(30, len(df)), random_state=42)
+
+        n_comp = min(self.pca_components, len(df))
+        pca = PCA(n_components=n_comp, random_state=42)
         reduced_embeddings = pca.fit_transform(embeddings)
 
-        # 3. Two-Step Agglomerative Clustering
-        patch_count = len(df)
+        # 3. Agglomerative Clustering
         clustering = AgglomerativeClustering(
-            n_clusters=None, distance_threshold=0.85, metric='cosine', linkage='average'
+            n_clusters=None,
+            distance_threshold=self.dist_threshold,
+            metric='cosine',
+            linkage='average'
         )
         labels = clustering.fit_predict(reduced_embeddings)
-
-        # Enforce upper limit from notebook logic
-        num_clusters = len(set(labels))
-        max_clusters = (patch_count // 5) * 3 if patch_count > 9 else None
-
-        if max_clusters and num_clusters > max_clusters:
-            clustering = AgglomerativeClustering(
-                n_clusters=max_clusters, metric='cosine', linkage='average'
-            )
-            labels = clustering.fit_predict(reduced_embeddings)
-
         df['cluster'] = labels
 
-        # 4. Metrics & Mapping
+        # 4. Generate Visualization
+        plot_url = self.generate_visualization(reduced_embeddings, labels)
+
+        # 5. Metrics & Labeling
         sil_score = None
         if 1 < len(set(labels)) < len(reduced_embeddings):
-            sil_score = silhouette_score(reduced_embeddings, labels, metric='cosine')
+            sil_score = float(silhouette_score(reduced_embeddings, labels, metric='cosine'))
 
         mapping = {}
         for cid in df['cluster'].unique():
@@ -133,12 +115,8 @@ class ClusteringService:
                 project_names=cluster_subset['name'].unique().tolist()
             ))
 
-        # NEW: Trigger visualization generation
-        plot_url = self.generate_visualization(df, reduced_embeddings)
-
         self.latest_results = {
             "status": "success",
-            "plot_url": plot_url,  # URL to access the image
             "total_clusters": len(mapping),
             "global_silhouette_score": sil_score,
             "summary": summary,
